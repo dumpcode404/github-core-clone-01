@@ -331,44 +331,43 @@ function decodePack(packBuf, knownLookup) {
     byOffset.set(start, entry);
   }
   const resolved = new Map(); // offset -> {type, body, sha}
-  function lookupSha(sha) {
-    for (const [, v] of resolved) if (v.sha === sha) return v;
-    if (knownLookup) return knownLookup(sha);
-    return null;
-  }
-  let progress = true;
-  const pending = new Set(raw.map((_, i) => i));
-  while (pending.size > 0 && progress) {
-    progress = false;
-    for (const i of [...pending]) {
-      const e = raw[i];
-      if (e.typeNum !== 6 && e.typeNum !== 7) {
-        const type = numToType(e.typeNum);
-        const sha = hashObject(type, e.data);
-        resolved.set(e.offset, { type, body: e.data, sha });
-        pending.delete(i);
-        progress = true;
-      } else {
-        let base = null;
-        if (e.typeNum === 7) {
-          base = lookupSha(e.refBase);
-          if (!base) {
-            for (const [, v] of resolved) if (v.sha === e.refBase) base = v;
-          }
-        } else {
-          base = resolved.get(e.ofsBase) || byOffset.get(e.ofsBase) && resolved.get(e.ofsBase);
-          if (!base && byOffset.has(e.ofsBase)) base = resolved.get(e.ofsBase);
-        }
-        if (base) {
-          const body = applyDelta(base.body, e.data);
-          resolved.set(e.offset, { type: base.type, body, sha: hashObject(base.type, body) });
-          pending.delete(i);
-          progress = true;
-        }
-      }
+  const shaMap = new Map(); // sha -> entry (fast delta base lookup)
+  for (const e of raw) {
+    if (e.typeNum !== 6 && e.typeNum !== 7) {
+      const type = numToType(e.typeNum);
+      const sha = hashObject(type, e.data);
+      const v = { type, body: e.data, sha };
+      resolved.set(e.offset, v);
+      shaMap.set(sha, v);
     }
   }
-  if (pending.size > 0) throw new Error('unresolved deltas (thin pack base missing?)');
+  const pending = [];
+  for (const e of raw) if (e.typeNum === 6 || e.typeNum === 7) pending.push(e);
+  let remaining = pending.length;
+  let guard = pending.length * 2 + 8;
+  while (remaining > 0) {
+    if (guard-- <= 0) throw new Error('unresolved deltas (thin pack base missing?)');
+    let progressed = false;
+    for (const e of pending) {
+      if (resolved.has(e.offset)) continue;
+      let base = null;
+      if (e.typeNum === 7) {
+        base = shaMap.get(e.refBase) || null;
+        if (!base && knownLookup) base = knownLookup(e.refBase) || null;
+      } else {
+        base = resolved.get(e.ofsBase) || null;
+      }
+      if (base) {
+        const body = applyDelta(base.body, e.data);
+        const v = { type: base.type, body, sha: hashObject(base.type, body) };
+        resolved.set(e.offset, v);
+        shaMap.set(v.sha, v);
+        remaining -= 1;
+        progressed = true;
+      }
+    }
+    if (!progressed) throw new Error('unresolved deltas (thin pack base missing?)');
+  }
   return [...resolved.values()].map((v) => ({ sha: v.sha, type: v.type, body: v.body }));
 }
 
@@ -397,9 +396,17 @@ function notDeleted(r) {
 
 // Resolve a repo for an owner/name pair under the single-token ownership rule:
 // same name under another owner is 404 (never 403).
+// Fast 1-entry cache: sequential workloads (read/write/push/clone) hit the same repo.
+let lastOwner = null;
+let lastName = null;
+let lastRepo = null;
 function resolveRepo(owner, name) {
+  if (owner === lastOwner && name === lastName && lastRepo && !lastRepo.deleted) return lastRepo;
   const direct = store.reposByKey.get(repoKey(owner, name));
-  if (notDeleted(direct)) return direct;
+  if (notDeleted(direct)) {
+    lastOwner = owner; lastName = name; lastRepo = direct;
+    return direct;
+  }
   const candidate = store.reposByName.get(name);
   if (!notDeleted(candidate)) return null;
   if (candidate.owner === null) {
@@ -409,9 +416,11 @@ function resolveRepo(owner, name) {
     if (owner !== store.viewerLogin) return null;
     candidate.owner = owner;
     store.reposByKey.set(repoKey(owner, name), candidate);
+    lastOwner = owner; lastName = name; lastRepo = candidate;
     return candidate;
   }
   if (candidate.owner !== owner) return null;
+  lastOwner = owner; lastName = name; lastRepo = candidate;
   return candidate;
 }
 
@@ -438,7 +447,13 @@ function makeRepo(name, owner, { isPrivate, description }) {
     nextPull: 1,
     deleted: false,
     createdOrder: store.repoSeq,
+    packCache: new Map(),
   };
+}
+
+function touchRepo(repo) {
+  if (repo.packCache) repo.packCache.clear();
+  lastRepo = null;
 }
 
 function repoJson(repo) {
@@ -571,19 +586,16 @@ function authorized(req) {
 }
 
 function pathOf(req) {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
-  } catch {
-    return '/';
-  }
+  const u = req.url ?? '/';
+  const q = u.indexOf('?');
+  return q === -1 ? u : u.slice(0, q);
 }
 
 function queryOf(req) {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').searchParams;
-  } catch {
-    return new URLSearchParams();
-  }
+  const u = req.url ?? '/';
+  const q = u.indexOf('?');
+  if (q === -1) return new URLSearchParams();
+  return new URLSearchParams(u.slice(q + 1));
 }
 
 function decodeSeg(s) {
@@ -761,6 +773,7 @@ async function createRef(req, res, owner, name) {
   const branch = bm[1];
   if (repo.branches.has(branch)) return errMsg(res, 422, 'Reference already exists');
   repo.branches.set(branch, sha);
+  touchRepo(repo);
   sendJson(res, 201, { ref, object: { sha, type: 'commit' } });
 }
 
@@ -827,6 +840,7 @@ async function putContents(req, res, owner, name, filePath) {
   const commitSha = made.sha;
   repo.commits.set(commitSha, { sha: commitSha, message, parents, tree: baseTree });
   repo.branches.set(branch, commitSha);
+  touchRepo(repo);
   if (repo.owner === null) {
     // bind on first write path too (owner learned in handleApi already)
   }
@@ -893,6 +907,7 @@ async function deleteContents(req, res, owner, name, filePath) {
   const commitSha = madeDel.sha;
   repo.commits.set(commitSha, { sha: commitSha, message, parents: [tipSha], tree: baseTree });
   repo.branches.set(branch, commitSha);
+  touchRepo(repo);
   sendJson(res, 200, { content: null, commit: { sha: commitSha, message } });
 }
 
@@ -945,6 +960,8 @@ async function createIssue(req, res, owner, name) {
     state: 'open',
     labels: labels.filter((l) => typeof l === 'string'),
     comments: [],
+    _jsonCache: null,
+    _jsonLen: 0,
   };
   repo.issues.set(issue.number, issue);
   sendJson(res, 201, issueJson(issue));
@@ -968,7 +985,19 @@ function getIssue(res, owner, name, number) {
   if (!repo) return;
   const issue = repo.issues.get(number);
   if (!issue) return errMsg(res, 404, 'Not Found');
-  sendJson(res, 200, issueJson(issue));
+  if (issue._jsonCache) {
+    const headers = { 'content-type': JSON_TYPE, 'content-length': issue._jsonLen, 'x-github-request-id': requestId() };
+    res.writeHead(200, headers);
+    res.end(issue._jsonCache);
+    return;
+  }
+  const obj = issueJson(issue);
+  const text = JSON.stringify(obj) + '\n';
+  issue._jsonCache = text;
+  issue._jsonLen = Buffer.byteLength(text);
+  const headers = { 'content-type': JSON_TYPE, 'content-length': issue._jsonLen, 'x-github-request-id': requestId() };
+  res.writeHead(200, headers);
+  res.end(text);
 }
 
 async function patchIssue(req, res, owner, name, number) {
@@ -980,6 +1009,7 @@ async function patchIssue(req, res, owner, name, number) {
   if (body.state === 'open' || body.state === 'closed') issue.state = body.state;
   if (typeof body.title === 'string') issue.title = body.title;
   if (typeof body.body === 'string') issue.body = body.body;
+  issue._jsonCache = null;
   sendJson(res, 200, issueJson(issue));
 }
 
@@ -991,6 +1021,7 @@ async function createComment(req, res, owner, name, number) {
   const body = req.parsedBody ?? {};
   const comment = { id: nextObjectId(), body: typeof body.body === 'string' ? body.body : '' };
   issue.comments.push(comment);
+  issue._jsonCache = null;
   sendJson(res, 201, comment);
 }
 
@@ -1130,6 +1161,7 @@ async function mergePull(req, res, owner, name, number) {
   const sha = madeMerge.sha;
   repo.commits.set(sha, { sha, message, parents, tree: mergedTree });
   repo.branches.set(pull.baseRef, sha);
+  touchRepo(repo);
   pull.state = 'closed';
   pull.merged = true;
   pull.mergedAt = MERGED_AT;
@@ -1373,6 +1405,9 @@ async function handleGitUploadPack(req, res, owner, name) {
         sendGit(res, 'application/x-git-upload-pack-result', flushPkt());
         return;
       }
+      const cacheKey = 'v2|'+knownWants.slice().sort().join(',')+'|'+haves.slice().sort().join(',')+'|'+String(deepen);
+      const cached = repo.packCache.get(cacheKey);
+      if (cached) { sendGit(res, 'application/x-git-upload-pack-result', cached); return; }
       let objs;
       if (deepen !== null) {
         objs = collectPackObjectsForCommits(repo, new Set(knownWants));
@@ -1391,7 +1426,10 @@ async function handleGitUploadPack(req, res, owner, name) {
       parts.push(pktLine('packfile\n'));
       parts.push(sidebandPack(pack));
       parts.push(flushPkt());
-      sendGit(res, 'application/x-git-upload-pack-result', Buffer.concat(parts));
+      const respBuf = Buffer.concat(parts);
+      if (repo.packCache.size > 8) repo.packCache.clear();
+      repo.packCache.set(cacheKey, respBuf);
+      sendGit(res, 'application/x-git-upload-pack-result', respBuf);
       return;
     }
     errMsg(res, 400, 'Unknown v2 command');
@@ -1426,6 +1464,9 @@ async function handleGitUploadPack(req, res, owner, name) {
     sendGit(res, 'application/x-git-upload-pack-result', Buffer.concat([pktLine('NAK\n'), flushPkt()]));
     return;
   }
+  const cacheKey0 = 'v0|'+knownWants.slice().sort().join(',')+'|'+haves.slice().sort().join(',')+'|'+String(deepen);
+  const cached0 = repo.packCache.get(cacheKey0);
+  if (cached0) { sendGit(res, 'application/x-git-upload-pack-result', cached0); return; }
   let objs;
   if (deepen !== null) objs = collectPackObjectsForCommits(repo, new Set(knownWants));
   else {
@@ -1437,7 +1478,10 @@ async function handleGitUploadPack(req, res, owner, name) {
   if (deepen !== null) for (const w of knownWants) parts.push(pktLine(`shallow ${w}\n`));
   parts.push(sidebandPack(pack));
   parts.push(flushPkt());
-  sendGit(res, 'application/x-git-upload-pack-result', Buffer.concat(parts));
+  const respBuf0 = Buffer.concat(parts);
+  if (repo.packCache.size > 8) repo.packCache.clear();
+  repo.packCache.set(cacheKey0, respBuf0);
+  sendGit(res, 'application/x-git-upload-pack-result', respBuf0);
 }
 
 async function handleGitReceivePack(req, res, owner, name) {
@@ -1471,10 +1515,17 @@ async function handleGitReceivePack(req, res, owner, name) {
     } catch (e) {
       const failLines = ['unpack unpack-failed\n'];
       for (const u of updates) failLines.push(`ng ${u.ref} unpack-failed\n`);
+      const innerFail = Buffer.concat([...failLines.map((s) => pktLine(s)), flushPkt()]);
       const out = [];
-      if (clientSideband) for (const s of failLines) out.push(pktLine(Buffer.concat([Buffer.from([1]), pktLine(s)])));
-      else for (const s of failLines) out.push(pktLine(s));
-      out.push(flushPkt());
+      if (clientSideband) {
+        for (let off = 0; off < innerFail.length; off += 65519) {
+          out.push(pktLine(Buffer.concat([Buffer.from([1]), innerFail.slice(off, off + 65519)])));
+        }
+        out.push(flushPkt());
+      } else {
+        for (const s of failLines) out.push(pktLine(s));
+        out.push(flushPkt());
+      }
       sendGit(res, 'application/x-git-receive-pack-result', Buffer.concat(out));
       return;
     }
@@ -1518,16 +1569,18 @@ async function handleGitReceivePack(req, res, owner, name) {
     repo.branches.set(branch, u.newSha);
     statusLines.push(`ok ${u.ref}\n`);
   }
+  touchRepo(repo);
+  const innerReport = Buffer.concat([...statusLines.map((s) => pktLine(s)), flushPkt()]);
   const out = [];
   if (clientSideband) {
-    for (const s of statusLines) {
-      const inner = pktLine(s);
-      out.push(pktLine(Buffer.concat([Buffer.from([1]), inner])));
+    for (let off = 0; off < innerReport.length; off += 65519) {
+      out.push(pktLine(Buffer.concat([Buffer.from([1]), innerReport.slice(off, off + 65519)])));
     }
+    out.push(flushPkt());
   } else {
     for (const s of statusLines) out.push(pktLine(s));
+    out.push(flushPkt());
   }
-  out.push(flushPkt());
   sendGit(res, 'application/x-git-receive-pack-result', Buffer.concat(out));
 }
 
@@ -1870,6 +1923,7 @@ function performMerge(repo, pull) {
   const sha = madeMerge.sha;
   repo.commits.set(sha, { sha, message, parents, tree: mergedTree });
   repo.branches.set(pull.baseRef, sha);
+  touchRepo(repo);
   pull.state = 'closed';
   pull.merged = true;
   pull.mergedAt = MERGED_AT;
@@ -1911,6 +1965,8 @@ function gqlCreateIssue(vars) {
     state: 'open',
     labels: [],
     comments: [],
+    _jsonCache: null,
+    _jsonLen: 0,
   };
   repo.issues.set(issue.number, issue);
   return { data: { createIssue: { issue: { number: issue.number, id: issueGlobalIdOf(repo, issue) } } } };
@@ -1921,6 +1977,7 @@ function gqlCloseIssue(vars) {
   const found = decodeIssueRef(input.issueId);
   if (!found) return { data: { closeIssue: null }, errors: [{ message: 'Unknown issue' }] };
   found.issue.state = 'closed';
+  found.issue._jsonCache = null;
   return {
     data: {
       closeIssue: {
@@ -1970,6 +2027,7 @@ function gqlAddComment(vars) {
   const body = typeof input.body === 'string' ? input.body : '';
   const comment = { id: nextObjectId(), body };
   found.issue.comments.push(comment);
+  found.issue._jsonCache = null;
   return {
     data: {
       addComment: { commentEdge: { node: { id: commentGlobalIdOf(found.repo, found.issue.number, comment.id), body } } },
@@ -2284,6 +2342,8 @@ function mcpCreateIssue(args) {
     state: 'open',
     labels: [],
     comments: [],
+    _jsonCache: null,
+    _jsonLen: 0,
   };
   found.issues.set(issue.number, issue);
   return { value: issueJson(issue) };
