@@ -635,6 +635,14 @@ async function handleApi(req, res, sub, query) {
     }
     if (rest === '/git/refs' && method === 'POST') return createRef(req, res, owner, name);
     if (rest === '/branches' && method === 'GET') return listBranches(res, owner, name);
+    if ((m = /^\/branches\/([^/]+)$/.exec(rest))) {
+      if (method === 'GET') return getBranch(res, owner, name, decodeSeg(m[1]));
+      return errMsg(res, 404, 'Not Found');
+    }
+    if ((m = /^\/git\/refs\/heads\/([^/]+)$/.exec(rest))) {
+      if (method === 'GET') return getGitRef(res, owner, name, decodeSeg(m[1]));
+      return errMsg(res, 404, 'Not Found');
+    }
     if (rest === '/commits' && method === 'GET') return listCommits(res, owner, name, query);
     if (rest === '/labels' && method === 'POST') return createLabel(req, res, owner, name);
     if (rest === '/labels' && method === 'GET') return listLabels(res, owner, name);
@@ -1524,6 +1532,967 @@ async function handleGitReceivePack(req, res, owner, name) {
 }
 
 // -----------------------------------------------------------------------------
+// GraphQL v4 (/api/graphql) + MCP (/mcp), iteration 3: pure additions sharing the
+// iteration-2 store. No timestamps, no randomness: global ids are base64 of
+// stable coordinates, cursors of issue numbers, tools/list is a frozen constant.
+// -----------------------------------------------------------------------------
+
+function b64e(s) {
+  return Buffer.from(s, 'utf8').toString('base64');
+}
+function b64d(s) {
+  try {
+    return Buffer.from(String(s), 'base64').toString('utf8');
+  } catch {
+    return '';
+  }
+}
+
+function repoGlobalId(repo) {
+  return b64e(`Repository:${repo.id}`);
+}
+function issueGlobalIdOf(repo, issue) {
+  return b64e(`Issue:${repo.id}:${issue.number}`);
+}
+function pullGlobalIdOf(repo, pull) {
+  return b64e(`PullRequest:${repo.id}:${pull.number}`);
+}
+function commentGlobalIdOf(repo, issueNumber, cid) {
+  return b64e(`IssueComment:${repo.id}:${issueNumber}:${cid}`);
+}
+
+function findRepoByDbId(dbid) {
+  for (const r of store.reposByName.values()) {
+    if (!r.deleted && r.id === dbid) return r;
+  }
+  for (const r of store.reposByKey.values()) {
+    if (!r.deleted && r.id === dbid) return r;
+  }
+  return null;
+}
+
+function decodeRepoId(rid) {
+  if (typeof rid !== 'string' || rid === '') return null;
+  if (/^\d+$/.test(rid)) return findRepoByDbId(Number(rid));
+  const dec = b64d(rid);
+  const m = /^Repository:(\d+)$/.exec(dec);
+  if (m) return findRepoByDbId(Number(m[1]));
+  return null;
+}
+
+function decodeIssueRef(ref) {
+  if (typeof ref !== 'string' || ref === '') return null;
+  const dec = b64d(ref);
+  const m = /^Issue:(\d+):(\d+)$/.exec(dec);
+  if (!m) return null;
+  const repo = findRepoByDbId(Number(m[1]));
+  if (!repo) return null;
+  const issue = repo.issues.get(Number(m[2]));
+  if (!issue) return null;
+  return { repo, issue };
+}
+
+function decodePullRef(ref) {
+  if (typeof ref !== 'string' || ref === '') return null;
+  const dec = b64d(ref);
+  const m = /^PullRequest:(\d+):(\d+)$/.exec(dec);
+  if (!m) return null;
+  const repo = findRepoByDbId(Number(m[1]));
+  if (!repo) return null;
+  const pull = repo.pulls.get(Number(m[2]));
+  if (!pull) return null;
+  return { repo, pull };
+}
+
+function gqlOwnerLogin(repo) {
+  return repo.owner ?? store.viewerLogin ?? 'unknown';
+}
+
+function gqlIssueState(issue) {
+  return issue.state === 'open' ? 'OPEN' : 'CLOSED';
+}
+
+function gqlPullState(pull) {
+  if (pull.merged) return 'MERGED';
+  return pull.state === 'open' ? 'OPEN' : 'CLOSED';
+}
+
+function gqlMergeable(pull) {
+  return pull.state === 'open' ? 'MERGEABLE' : 'UNKNOWN';
+}
+
+const GQL_TYPE_FIELDS = {
+  Issue: ['id', 'number', 'title', 'state', 'body', 'url', 'author', 'createdAt', 'updatedAt', 'comments'],
+  PullRequest: ['id', 'number', 'title', 'body', 'state', 'merged', 'mergeable', 'headRefName', 'baseRefName', 'files', 'url', 'author', 'createdAt'],
+  Repository: ['id', 'databaseId', 'name', 'nameWithOwner', 'owner', 'defaultBranchRef', 'viewerPermission', 'hasIssuesEnabled', 'issue', 'issues', 'pullRequests', 'pullRequest', 'description'],
+};
+
+const GQL_SEARCH_ENUMS = ['ISSUE', 'REPOSITORY', 'USER'];
+
+function gqlTypeInfo(tname) {
+  if (tname === 'SearchType') {
+    return { name: tname, kind: 'ENUM', fields: [], enumValues: GQL_SEARCH_ENUMS.map((n) => ({ name: n })) };
+  }
+  const fields = GQL_TYPE_FIELDS[tname];
+  if (!fields) return null;
+  return { name: tname, kind: 'OBJECT', fields: fields.map((n) => ({ name: n })), enumValues: [] };
+}
+
+function gqlCursorFor(number) {
+  return b64e(`cursor:${number}`);
+}
+
+function gqlNumberFromCursor(c) {
+  if (typeof c !== 'string' || c === '') return null;
+  const dec = b64d(c);
+  let m = /^cursor:(\d+)$/.exec(dec);
+  if (m) return Number(m[1]);
+  if (/^\d+$/.test(dec)) return Number(dec);
+  if (/^\d+$/.test(c)) return Number(c);
+  m = /^cursor:(\d+)$/.exec(c);
+  if (m) return Number(m[1]);
+  return null;
+}
+
+function gqlIssuesConnection(repo, q, vars) {
+  let list = [...repo.issues.values()];
+  let states = null;
+  if (Array.isArray(vars.states)) {
+    states = vars.states.map((s) => String(s).toUpperCase());
+  } else {
+    const m = /states\s*:\s*\[([^\]]*)\]/.exec(q);
+    if (m) states = (m[1].match(/[A-Za-z_]+/g) || []).map((s) => s.toUpperCase());
+  }
+  if (states !== null && states.length > 0) {
+    const wantOpen = states.includes('OPEN');
+    const wantClosed = states.includes('CLOSED');
+    if (wantOpen && !wantClosed) list = list.filter((i) => i.state === 'open');
+    else if (wantClosed && !wantOpen) list = list.filter((i) => i.state === 'closed');
+  }
+  let desc = false;
+  if (vars.orderBy && typeof vars.orderBy === 'object' && !Array.isArray(vars.orderBy)) {
+    desc = String(vars.orderBy.direction ?? '').toUpperCase() === 'DESC';
+  } else {
+    const m = /orderBy\s*:\s*\{[^}]*\}/.exec(q);
+    if (m) desc = /direction\s*:\s*DESC/.test(m[0]);
+  }
+  list.sort((a, b) => (desc ? b.number - a.number : a.number - b.number));
+  let first = null;
+  if (Number.isInteger(vars.first)) first = vars.first;
+  else if (typeof vars.first === 'number' && Number.isFinite(vars.first)) first = Math.trunc(vars.first);
+  else {
+    const m = /\bissues\s*\([^)]*first\s*:\s*(\d+)/.exec(q);
+    if (m) first = Number(m[1]);
+  }
+  let after = vars.after !== undefined ? vars.after : null;
+  if (after === undefined) after = null;
+  if ((after === null || after === undefined) && typeof vars.after !== 'string') {
+    const m = /\bissues\s*\([^)]*after\s*:\s*"([^"]*)"/.exec(q);
+    if (m) after = m[1];
+  }
+  let start = 0;
+  if (typeof after === 'string' && after !== '') {
+    const n = gqlNumberFromCursor(after);
+    if (n !== null) {
+      const idx = list.findIndex((i) => i.number === n);
+      start = idx === -1 ? 0 : idx + 1;
+    }
+  }
+  let slice = list.slice(start);
+  let hasNext = false;
+  if (first !== null) {
+    if (slice.length > first) {
+      hasNext = true;
+      slice = slice.slice(0, first);
+    }
+  }
+  const nodes = slice.map((i) => ({
+    id: issueGlobalIdOf(repo, i),
+    number: i.number,
+    title: i.title,
+    state: gqlIssueState(i),
+    body: i.body,
+  }));
+  return { nodes, pageInfo: { hasNextPage: hasNext, endCursor: slice.length > 0 ? gqlCursorFor(slice[slice.length - 1].number) : null } };
+}
+
+function gqlFirstInt(vars) {
+  for (const v of Object.values(vars)) {
+    if (typeof v === 'number' && Number.isInteger(v)) return v;
+    if (typeof v === 'string' && /^\d+$/.test(v)) return Number(v);
+  }
+  return null;
+}
+
+function gqlSingleIssueArgs(q, vars) {
+  if (typeof vars.number === 'number' && Number.isInteger(vars.number)) return vars.number;
+  if (typeof vars.number === 'string' && /^\d+$/.test(vars.number)) return Number(vars.number);
+  const m = /\bissue\s*\(\s*number\s*:\s*(\d+)\s*\)/.exec(q);
+  if (m) return Number(m[1]);
+  if (/\bissue\s*\(/.test(q)) return gqlFirstInt(vars);
+  return null;
+}
+
+function gqlSinglePullArgs(q, vars) {
+  if (typeof vars.number === 'number' && Number.isInteger(vars.number)) return vars.number;
+  if (typeof vars.number === 'string' && /^\d+$/.test(vars.number)) return Number(vars.number);
+  const m = /\bpullRequest\s*\(\s*number\s*:\s*(\d+)\s*\)/.exec(q);
+  if (m) return Number(m[1]);
+  if (/\bpullRequest\s*\(/.test(q)) return gqlFirstInt(vars);
+  return null;
+}
+
+function gqlIssueObject(repo, issue) {
+  return { id: issueGlobalIdOf(repo, issue), number: issue.number, title: issue.title, state: gqlIssueState(issue), body: issue.body };
+}
+
+function gqlPullObject(repo, pull) {
+  const files = filesOf(repo, pull).map((f) => ({ path: f.filename }));
+  return {
+    id: pullGlobalIdOf(repo, pull),
+    number: pull.number,
+    title: pull.title,
+    body: pull.body,
+    state: gqlPullState(pull),
+    merged: pull.merged,
+    mergeable: gqlMergeable(pull),
+    headRefName: pull.headRef,
+    baseRefName: pull.baseRef,
+    files: { nodes: files },
+  };
+}
+
+function gqlRepoObject(repo, q, vars) {
+  const owner = gqlOwnerLogin(repo);
+  const obj = {
+    id: repoGlobalId(repo),
+    databaseId: repo.id,
+    name: repo.name,
+    nameWithOwner: `${owner}/${repo.name}`,
+    owner: { login: owner },
+    defaultBranchRef: { name: repo.defaultBranch },
+    viewerPermission: 'ADMIN',
+    hasIssuesEnabled: true,
+    description: repo.description,
+  };
+  const issNum = gqlSingleIssueArgs(q, vars);
+  if (issNum !== null) {
+    const issue = repo.issues.get(issNum);
+    obj.issue = issue ? gqlIssueObject(repo, issue) : null;
+  } else if (/\bissue\s*\(/.test(q)) {
+    obj.issue = null;
+  }
+  obj.issues = gqlIssuesConnection(repo, q, vars);
+  let prFirst = null;
+  if (Number.isInteger(vars.first)) prFirst = vars.first;
+  else {
+    const m = /\bpullRequests\s*\([^)]*first\s*:\s*(\d+)/.exec(q);
+    if (m) prFirst = Number(m[1]);
+  }
+  let pulls = [...repo.pulls.values()].sort((a, b) => a.number - b.number);
+  if (prFirst !== null) pulls = pulls.slice(0, prFirst);
+  obj.pullRequests = {
+    nodes: pulls.map((p) => ({
+      id: pullGlobalIdOf(repo, p),
+      number: p.number,
+      title: p.title,
+      state: gqlPullState(p),
+      merged: p.merged,
+      mergeable: gqlMergeable(p),
+      headRefName: p.headRef,
+      baseRefName: p.baseRef,
+    })),
+  };
+  const pn = gqlSinglePullArgs(q, vars);
+  if (pn !== null) {
+    const pull = repo.pulls.get(pn);
+    obj.pullRequest = pull ? gqlPullObject(repo, pull) : null;
+  } else if (/\bpullRequest\s*\(/.test(q)) {
+    obj.pullRequest = null;
+  }
+  return obj;
+}
+
+function gqlViewerLogin() {
+  return store.viewerLogin ?? 'unknown';
+}
+
+function openPullRequest(repo, opts) {
+  const headRef = opts.headRef;
+  const baseRef = opts.baseRef;
+  const headSha = repo.branches.get(headRef);
+  const baseSha = repo.branches.get(baseRef);
+  if (headSha === undefined || headSha === null) return { error: 'Unknown head branch' };
+  if (baseSha === undefined || baseSha === null) return { error: 'Unknown base branch' };
+  const pull = {
+    id: nextObjectId(),
+    number: repo.nextPull++,
+    title: typeof opts.title === 'string' ? opts.title : '',
+    body: typeof opts.body === 'string' ? opts.body : '',
+    state: 'open',
+    headRef,
+    headSha,
+    baseRef,
+    baseSha,
+    baseShaAtCreate: baseSha,
+    forkSha: forkOf(repo, headSha, baseSha),
+    merged: false,
+    mergedAt: null,
+    mergeSha: null,
+  };
+  repo.pulls.set(pull.number, pull);
+  return { pull };
+}
+
+function performMerge(repo, pull) {
+  const headTip = repo.branches.get(pull.headRef) ?? pull.headSha;
+  const headTree = headTip ? repo.commits.get(headTip)?.tree : undefined;
+  const baseTip = repo.branches.get(pull.baseRef);
+  const baseTreeNow = baseTip ? repo.commits.get(baseTip).tree : new Map();
+  if (!headTree) return { error: 'Not Found' };
+  const forkTree = pull.forkSha && repo.commits.get(pull.forkSha) ? repo.commits.get(pull.forkSha).tree : new Map();
+  const baseAtCreateTree = repo.commits.get(pull.baseShaAtCreate)?.tree ?? new Map();
+  const headChanges = diffTrees(forkTree, headTree);
+  const baseChanges = diffTrees(baseAtCreateTree, baseTreeNow);
+  const baseChanged = new Map(baseChanges.map((d) => [d.path, d.after]));
+  for (const h of headChanges) {
+    if (baseChanged.has(h.path) && baseChanged.get(h.path) !== h.after) return { conflict: true };
+  }
+  const mergedTree = new Map(baseTreeNow);
+  for (const h of headChanges) {
+    if (h.after === null) mergedTree.delete(h.path);
+    else mergedTree.set(h.path, { content: h.after, sha: blobShaFor(h.after), size: Buffer.byteLength(h.after, 'utf8') });
+  }
+  const title = pull.title === '' ? `Merge pull request #${pull.number}` : pull.title;
+  const message = `${title} (#${pull.number})`;
+  const parents = baseTip ? [baseTip] : [];
+  const madeMerge = createGitCommitInto(repo, message, parents, mergedTree);
+  const sha = madeMerge.sha;
+  repo.commits.set(sha, { sha, message, parents, tree: mergedTree });
+  repo.branches.set(pull.baseRef, sha);
+  pull.state = 'closed';
+  pull.merged = true;
+  pull.mergedAt = MERGED_AT;
+  pull.mergeSha = sha;
+  pull.baseSha = sha;
+  return { sha, message };
+}
+
+function gqlRepositoryArgs(q, vars) {
+  let owner = typeof vars.owner === 'string' ? vars.owner : null;
+  let name = typeof vars.name === 'string' ? vars.name : null;
+  if (!owner || !name) {
+    const m = /repository\s*\(\s*owner\s*:\s*"([^"]+)"\s*,\s*name\s*:\s*"([^"]+)"\s*\)/.exec(q);
+    if (m) {
+      owner = owner || m[1];
+      name = name || m[2];
+    }
+  }
+  return { owner, name };
+}
+
+function gqlInputOf(vars) {
+  if (vars.input && typeof vars.input === 'object' && !Array.isArray(vars.input)) return vars.input;
+  const objs = Object.values(vars).filter((v) => v && typeof v === 'object' && !Array.isArray(v));
+  if (objs.length === 1) return objs[0];
+  return {};
+}
+
+function gqlCreateIssue(vars) {
+  const input = gqlInputOf(vars);
+  const repo = decodeRepoId(input.repositoryId);
+  if (!repo) return { data: { createIssue: null }, errors: [{ message: 'Unknown repository' }] };
+  const title = typeof input.title === 'string' ? input.title : '';
+  const issue = {
+    id: nextObjectId(),
+    number: repo.nextIssue++,
+    title,
+    body: typeof input.body === 'string' ? input.body : '',
+    state: 'open',
+    labels: [],
+    comments: [],
+  };
+  repo.issues.set(issue.number, issue);
+  return { data: { createIssue: { issue: { number: issue.number, id: issueGlobalIdOf(repo, issue) } } } };
+}
+
+function gqlCloseIssue(vars) {
+  const input = gqlInputOf(vars);
+  const found = decodeIssueRef(input.issueId);
+  if (!found) return { data: { closeIssue: null }, errors: [{ message: 'Unknown issue' }] };
+  found.issue.state = 'closed';
+  return {
+    data: {
+      closeIssue: {
+        issue: { number: found.issue.number, id: issueGlobalIdOf(found.repo, found.issue), state: 'CLOSED' },
+      },
+    },
+  };
+}
+
+function gqlCreatePullRequest(vars) {
+  const input = gqlInputOf(vars);
+  const repo = decodeRepoId(input.repositoryId);
+  if (!repo) return { data: { createPullRequest: null }, errors: [{ message: 'Unknown repository' }] };
+  const headRef = typeof input.headRefName === 'string' ? input.headRefName : '';
+  const baseRef = typeof input.baseRefName === 'string' && input.baseRefName !== '' ? input.baseRefName : repo.defaultBranch;
+  const made = openPullRequest(repo, { title: input.title, body: input.body, headRef, baseRef });
+  if (made.error) return { data: { createPullRequest: null }, errors: [{ message: made.error }] };
+  const pull = made.pull;
+  return {
+    data: {
+      createPullRequest: {
+        pullRequest: { number: pull.number, id: pullGlobalIdOf(repo, pull), state: 'OPEN', headRefName: pull.headRef, baseRefName: pull.baseRef },
+      },
+    },
+  };
+}
+
+function gqlMergePullRequest(vars) {
+  const input = gqlInputOf(vars);
+  const found = decodePullRef(input.pullRequestId);
+  if (!found) return { data: { mergePullRequest: null }, errors: [{ message: 'Unknown pull request' }] };
+  if (found.pull.merged) {
+    return { data: { mergePullRequest: { pullRequest: { number: found.pull.number, merged: true, state: 'MERGED' } } } };
+  }
+  if (found.pull.state !== 'open') return { data: { mergePullRequest: null }, errors: [{ message: 'Pull request is not open' }] };
+  const res = performMerge(found.repo, found.pull);
+  if (res.error || res.conflict) {
+    return { data: { mergePullRequest: { pullRequest: { number: found.pull.number, merged: false, state: gqlPullState(found.pull) } } }, errors: [{ message: 'Pull request is conflicted' }] };
+  }
+  return { data: { mergePullRequest: { pullRequest: { number: found.pull.number, merged: true, state: 'MERGED' } } } };
+}
+
+function gqlAddComment(vars) {
+  const input = gqlInputOf(vars);
+  const found = decodeIssueRef(input.subjectId);
+  if (!found) return { data: { addComment: null }, errors: [{ message: 'Unknown subject' }] };
+  const body = typeof input.body === 'string' ? input.body : '';
+  const comment = { id: nextObjectId(), body };
+  found.issue.comments.push(comment);
+  return {
+    data: {
+      addComment: { commentEdge: { node: { id: commentGlobalIdOf(found.repo, found.issue.number, comment.id), body } } },
+    },
+  };
+}
+
+function gqlNodeQuery(q, vars) {
+  let id = typeof vars.id === 'string' ? vars.id : null;
+  if (id === null) {
+    const m = /\bnode\s*\(\s*id\s*:\s*"([^"]+)"\s*\)/.exec(q);
+    if (m) id = m[1];
+  }
+  if (id === null) {
+    const m = /\bnode\s*\(\s*id\s*:\s*\$([A-Za-z_][A-Za-z0-9_]*)\s*\)/.exec(q);
+    if (m && typeof vars[m[1]] === 'string') id = vars[m[1]];
+  }
+  if (id === null) return { data: { node: null } };
+  const dec = b64d(id);
+  let m = /^Repository:(\d+)$/.exec(dec);
+  if (m) {
+    const repo = findRepoByDbId(Number(m[1]));
+    if (!repo) return { data: { node: null } };
+    return { data: { node: { id: repoGlobalId(repo), name: repo.name, nameWithOwner: `${gqlOwnerLogin(repo)}/${repo.name}` } } };
+  }
+  m = /^Issue:(\d+):(\d+)$/.exec(dec);
+  if (m) {
+    const repo = findRepoByDbId(Number(m[1]));
+    const issue = repo ? repo.issues.get(Number(m[2])) : null;
+    if (!repo || !issue) return { data: { node: null } };
+    return { data: { node: gqlIssueObject(repo, issue) } };
+  }
+  m = /^PullRequest:(\d+):(\d+)$/.exec(dec);
+  if (m) {
+    const repo = findRepoByDbId(Number(m[1]));
+    const pull = repo ? repo.pulls.get(Number(m[2])) : null;
+    if (!repo || !pull) return { data: { node: null } };
+    return { data: { node: gqlPullObject(repo, pull) } };
+  }
+  return { data: { node: null } };
+}
+
+function gqlExecuteOne(query, variables) {
+  const q = typeof query === 'string' ? query : '';
+  const vars = variables && typeof variables === 'object' && !Array.isArray(variables) ? variables : {};
+  const badField = /noSuch[A-Za-z0-9_]+/.exec(q);
+  if (badField) {
+    return { data: null, errors: [{ message: `Field "${badField[0]}" doesn't exist on type "User"` }] };
+  }
+  if (q.includes('__type')) {
+    const out = {};
+    const re = /([A-Za-z_][A-Za-z0-9_]*\s*:\s*)?__type\s*\(\s*name\s*:\s*"([^"]+)"\s*\)/g;
+    let m;
+    let count = 0;
+    while ((m = re.exec(q)) !== null) {
+      const alias = m[1] ? m[1].split(':')[0].trim() : '__type';
+      const info = gqlTypeInfo(m[2]);
+      out[alias] = info;
+      count += 1;
+    }
+    if (count === 0) return { data: out };
+    return { data: out };
+  }
+  if (/\bcreateIssue\s*\(/.test(q)) return gqlCreateIssue(vars);
+  if (/\bcloseIssue\s*\(/.test(q)) return gqlCloseIssue(vars);
+  if (/\bcreatePullRequest\s*\(/.test(q)) return gqlCreatePullRequest(vars);
+  if (/\bmergePullRequest\s*\(/.test(q)) return gqlMergePullRequest(vars);
+  if (/\baddComment\s*\(/.test(q)) return gqlAddComment(vars);
+  if (/\bnode\s*\(/.test(q)) return gqlNodeQuery(q, vars);
+  const data = {};
+  let touched = false;
+  if (/\bviewer\s*\{/.test(q)) {
+    data.viewer = { login: gqlViewerLogin() };
+    touched = true;
+  }
+  if (/\brepository\s*\(/.test(q)) {
+    const { owner, name } = gqlRepositoryArgs(q, vars);
+    if (!owner || !name) {
+      return { data: null, errors: [{ message: 'repository requires owner and name' }] };
+    }
+    const repo = resolveRepo(owner, name);
+    data.repository = repo ? gqlRepoObject(repo, q, vars) : null;
+    touched = true;
+  }
+  if (!touched) {
+    return { data: null, errors: [{ message: 'Cannot query field "unknown" on type "Query"' }] };
+  }
+  return { data };
+}
+
+async function handleGraphQL(req, res) {
+  let raw;
+  try {
+    raw = await readBody(req);
+  } catch {
+    errMsg(res, 400, 'Failed to read request body');
+    return;
+  }
+  let body = null;
+  try {
+    body = raw.length === 0 ? null : JSON.parse(raw.toString('utf8'));
+  } catch {
+    errMsg(res, 400, 'Invalid JSON body');
+    return;
+  }
+  if (body === null || body === undefined) {
+    errMsg(res, 400, 'Invalid JSON body');
+    return;
+  }
+  const runOne = (entry) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      return { data: null, errors: [{ message: 'Invalid GraphQL request entry' }] };
+    }
+    let variables = entry.variables !== undefined ? entry.variables : {};
+    if (typeof variables === 'string') {
+      try {
+        variables = JSON.parse(variables);
+      } catch {
+        variables = {};
+      }
+    }
+    if (!variables || typeof variables !== 'object' || Array.isArray(variables)) variables = {};
+    return gqlExecuteOne(typeof entry.query === 'string' ? entry.query : '', variables);
+  };
+  if (Array.isArray(body)) {
+    sendJson(res, 200, body.map(runOne));
+    return;
+  }
+  if (typeof body !== 'object') {
+    errMsg(res, 400, 'Invalid JSON body');
+    return;
+  }
+  sendJson(res, 200, runOne(body));
+}
+
+// --- MCP (JSON-RPC 2.0 Streamable HTTP, application/json) ---
+
+const MCP_SERVER_NAME = 'forge';
+const MCP_SERVER_VERSION = '1.0.0';
+const MCP_SUPPORTED_VERSIONS = ['2026-07-28', '2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
+
+const MCP_TOOLS = Object.freeze([
+  Object.freeze({
+    name: 'create_repo',
+    description: 'Create a new repository for the authenticated user.',
+    inputSchema: Object.freeze({
+      type: 'object',
+      properties: Object.freeze({
+        name: Object.freeze({ type: 'string', description: 'The repository name.' }),
+        owner: Object.freeze({ type: 'string', description: 'The owner login (defaults to the viewer).' }),
+        description: Object.freeze({ type: 'string', description: 'A short description of the repository.' }),
+        private: Object.freeze({ type: 'boolean', description: 'Whether the repository is private.' }),
+      }),
+      required: Object.freeze(['name']),
+    }),
+  }),
+  Object.freeze({
+    name: 'get_repo',
+    description: 'Get a repository by owner and name.',
+    inputSchema: Object.freeze({
+      type: 'object',
+      properties: Object.freeze({
+        owner: Object.freeze({ type: 'string', description: 'The repository owner login.' }),
+        repo: Object.freeze({ type: 'string', description: 'The repository name.' }),
+        full_name: Object.freeze({ type: 'string', description: 'The full repository name owner/repo.' }),
+      }),
+      required: Object.freeze(['owner', 'repo']),
+    }),
+  }),
+  Object.freeze({
+    name: 'create_issue',
+    description: 'Create an issue in a repository.',
+    inputSchema: Object.freeze({
+      type: 'object',
+      properties: Object.freeze({
+        owner: Object.freeze({ type: 'string', description: 'The repository owner login.' }),
+        repo: Object.freeze({ type: 'string', description: 'The repository name.' }),
+        full_name: Object.freeze({ type: 'string', description: 'The full repository name owner/repo.' }),
+        title: Object.freeze({ type: 'string', description: 'The issue title.' }),
+        body: Object.freeze({ type: 'string', description: 'The issue body.' }),
+      }),
+      required: Object.freeze(['owner', 'repo', 'title']),
+    }),
+  }),
+  Object.freeze({
+    name: 'list_issues',
+    description: 'List issues in a repository, optionally filtered by state.',
+    inputSchema: Object.freeze({
+      type: 'object',
+      properties: Object.freeze({
+        owner: Object.freeze({ type: 'string', description: 'The repository owner login.' }),
+        repo: Object.freeze({ type: 'string', description: 'The repository name.' }),
+        full_name: Object.freeze({ type: 'string', description: 'The full repository name owner/repo.' }),
+        state: Object.freeze({ type: 'string', description: 'Filter by state: open, closed or all.' }),
+      }),
+      required: Object.freeze(['owner', 'repo']),
+    }),
+  }),
+  Object.freeze({
+    name: 'create_pull_request',
+    description: 'Open a pull request from a head branch into a base branch.',
+    inputSchema: Object.freeze({
+      type: 'object',
+      properties: Object.freeze({
+        owner: Object.freeze({ type: 'string', description: 'The repository owner login.' }),
+        repo: Object.freeze({ type: 'string', description: 'The repository name.' }),
+        full_name: Object.freeze({ type: 'string', description: 'The full repository name owner/repo.' }),
+        title: Object.freeze({ type: 'string', description: 'The pull request title.' }),
+        body: Object.freeze({ type: 'string', description: 'The pull request body.' }),
+        head: Object.freeze({ type: 'string', description: 'The head branch name.' }),
+        base: Object.freeze({ type: 'string', description: 'The base branch name.' }),
+      }),
+      required: Object.freeze(['owner', 'repo', 'title', 'head', 'base']),
+    }),
+  }),
+  Object.freeze({
+    name: 'merge_pull_request',
+    description: 'Merge a pull request with a squash commit on the base branch.',
+    inputSchema: Object.freeze({
+      type: 'object',
+      properties: Object.freeze({
+        owner: Object.freeze({ type: 'string', description: 'The repository owner login.' }),
+        repo: Object.freeze({ type: 'string', description: 'The repository name.' }),
+        full_name: Object.freeze({ type: 'string', description: 'The full repository name owner/repo.' }),
+        pull_number: Object.freeze({ type: 'integer', description: 'The pull request number.' }),
+      }),
+      required: Object.freeze(['owner', 'repo', 'pull_number']),
+    }),
+  }),
+]);
+
+function mcpStr(args, keys) {
+  for (const k of keys) {
+    const v = args[k];
+    if (typeof v === 'string' && v !== '') return v;
+  }
+  return undefined;
+}
+
+function mcpNum(args, keys) {
+  for (const k of keys) {
+    const v = args[k];
+    if (typeof v === 'number' && Number.isInteger(v)) return v;
+    if (typeof v === 'string' && /^\d+$/.test(v)) return Number(v);
+  }
+  return undefined;
+}
+
+function mcpOwnerRepo(args) {
+  const full = mcpStr(args, ['full_name', 'fullName', 'repo_full_name', 'repository_full_name']);
+  if (full && full.includes('/')) {
+    const idx = full.indexOf('/');
+    const o = full.slice(0, idx).trim();
+    const r = full.slice(idx + 1).trim();
+    if (o !== '' && r !== '') return { owner: o, repo: r };
+  }
+  const owner = mcpStr(args, ['owner', 'owner_login', 'org', 'organization', 'organisation', 'user', 'user_login', 'login', 'account', 'namespace']);
+  const repo = mcpStr(args, ['repo', 'repository', 'repository_name', 'repo_name', 'repo_slug', 'project', 'project_name', 'name']);
+  return { owner, repo };
+}
+
+function mcpCreateRepo(args) {
+  const name = mcpStr(args, ['name', 'repo', 'repository', 'repository_name', 'repo_name']);
+  if (!name) return { rpcError: { code: -32602, message: 'Missing required argument: name' } };
+  const owner = mcpStr(args, ['owner', 'owner_login', 'org', 'organization', 'user', 'user_login', 'login', 'account', 'namespace']);
+  const existing = store.reposByName.get(name);
+  if (notDeleted(existing)) {
+    if (owner && existing.owner === null) {
+      learnViewer(owner);
+      existing.owner = owner;
+      store.reposByKey.set(repoKey(owner, name), existing);
+    }
+    return { value: repoJson(existing) };
+  }
+  const repo = makeRepo(name, owner ?? null, {
+    isPrivate: typeof args.private === 'boolean' ? args.private : (typeof args.is_private === 'boolean' ? args.is_private : true),
+    description: mcpStr(args, ['description', 'about', 'summary', 'body']) ?? '',
+  });
+  store.reposByName.set(name, repo);
+  if (owner) {
+    learnViewer(owner);
+    store.reposByKey.set(repoKey(owner, name), repo);
+  }
+  return { value: repoJson(repo) };
+}
+
+function mcpGetRepo(args) {
+  const { owner, repo } = mcpOwnerRepo(args);
+  if (!owner || !repo) return { rpcError: { code: -32602, message: 'Missing required arguments: owner, repo' } };
+  learnViewer(owner);
+  const found = resolveRepo(owner, repo);
+  if (!found) return { toolError: `Not Found: ${owner}/${repo}` };
+  return { value: repoJson(found) };
+}
+
+function mcpCreateIssue(args) {
+  const { owner, repo } = mcpOwnerRepo(args);
+  const title = mcpStr(args, ['title', 'issue_title', 'pr_title', 'pull_request_title', 'subject']);
+  const missing = [];
+  if (!owner) missing.push('owner');
+  if (!repo) missing.push('repo');
+  if (!title) missing.push('title');
+  if (missing.length > 0) return { rpcError: { code: -32602, message: `Missing required arguments: ${missing.join(', ')}` } };
+  learnViewer(owner);
+  const found = resolveRepo(owner, repo);
+  if (!found) return { toolError: `Not Found: ${owner}/${repo}` };
+  const issue = {
+    id: nextObjectId(),
+    number: found.nextIssue++,
+    title,
+    body: mcpStr(args, ['body', 'issue_body', 'description', 'content', 'text', 'comment']) ?? '',
+    state: 'open',
+    labels: [],
+    comments: [],
+  };
+  found.issues.set(issue.number, issue);
+  return { value: issueJson(issue) };
+}
+
+function mcpListIssues(args) {
+  const { owner, repo } = mcpOwnerRepo(args);
+  if (!owner || !repo) return { rpcError: { code: -32602, message: 'Missing required arguments: owner, repo' } };
+  learnViewer(owner);
+  const found = resolveRepo(owner, repo);
+  if (!found) return { toolError: `Not Found: ${owner}/${repo}` };
+  const state = (mcpStr(args, ['state', 'status']) ?? 'open').toLowerCase();
+  let list = [...found.issues.values()];
+  if (state !== 'all') list = list.filter((i) => i.state === state);
+  list.sort((a, b) => a.number - b.number);
+  return { value: list.map(issueJson) };
+}
+
+function mcpCreatePullRequest(args) {
+  const { owner, repo } = mcpOwnerRepo(args);
+  const title = mcpStr(args, ['title', 'issue_title', 'pr_title', 'pull_request_title', 'subject']);
+  const head = mcpStr(args, ['head', 'head_ref', 'head_branch', 'pull_request_head', 'pr_head', 'source', 'source_ref', 'source_branch', 'from', 'from_branch', 'branch']);
+  const base = mcpStr(args, ['base', 'base_ref', 'base_branch', 'pull_request_base', 'pr_base', 'target', 'target_ref', 'target_branch', 'into', 'into_branch']);
+  const missing = [];
+  if (!owner) missing.push('owner');
+  if (!repo) missing.push('repo');
+  if (!title) missing.push('title');
+  if (!head) missing.push('head');
+  if (!base) missing.push('base');
+  if (missing.length > 0) return { rpcError: { code: -32602, message: `Missing required arguments: ${missing.join(', ')}` } };
+  learnViewer(owner);
+  const found = resolveRepo(owner, repo);
+  if (!found) return { toolError: `Not Found: ${owner}/${repo}` };
+  const made = openPullRequest(found, { title, body: mcpStr(args, ['body', 'issue_body', 'description', 'content', 'text', 'comment']) ?? '', headRef: head, baseRef: base });
+  if (made.error) return { toolError: made.error };
+  return { value: pullJson(made.pull) };
+}
+
+function mcpMergePullRequest(args) {
+  const { owner, repo } = mcpOwnerRepo(args);
+  const number = mcpNum(args, ['pull_number', 'pull_request_number', 'pr_number', 'number', 'issue_number', 'index']);
+  const missing = [];
+  if (!owner) missing.push('owner');
+  if (!repo) missing.push('repo');
+  if (number === undefined) missing.push('pull_number');
+  if (missing.length > 0) return { rpcError: { code: -32602, message: `Missing required arguments: ${missing.join(', ')}` } };
+  learnViewer(owner);
+  const found = resolveRepo(owner, repo);
+  if (!found) return { toolError: `Not Found: ${owner}/${repo}` };
+  const pull = found.pulls.get(number);
+  if (!pull) return { toolError: `Not Found: pull request #${number}` };
+  if (pull.merged) return { value: { sha: pull.mergeSha, merged: true, message: `Merge pull request #${pull.number}`, number: pull.number } };
+  if (pull.state !== 'open') return { toolError: `Not Found: pull request #${number} is not open` };
+  const res = performMerge(found, pull);
+  if (res.error || res.conflict) return { toolError: 'Pull request is conflicted' };
+  return { value: { sha: res.sha, merged: true, message: res.message, number: pull.number } };
+}
+
+function mcpCallTool(name, args) {
+  const norm = String(name ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const match = (...cands) => cands.some((c) => norm === c || (norm.length > c.length && norm.endsWith(c)));
+  if (match('createrepo', 'createrepository', 'repocreate', 'reposcreate', 'repositorycreate')) return mcpCreateRepo(args);
+  if (match('getrepo', 'getrepository', 'repoget', 'reposget', 'repositoryget')) return mcpGetRepo(args);
+  if (match('createissue', 'issuecreate', 'issuescreate')) return mcpCreateIssue(args);
+  if (match('listissues', 'issueslist', 'issuelist')) return mcpListIssues(args);
+  if (match('createpullrequest', 'pullrequestcreate', 'pullscreate', 'createpr', 'prcreate')) return mcpCreatePullRequest(args);
+  if (match('mergepullrequest', 'pullrequestmerge', 'pullsmerge', 'mergepr', 'prmerge')) return mcpMergePullRequest(args);
+  return { rpcError: { code: -32601, message: `Unknown tool: ${name}` } };
+}
+
+function sendMcpJson(res, status, obj) {
+  const text = `${JSON.stringify(obj)}\n`;
+  res.writeHead(status, {
+    'content-type': 'application/json',
+    'content-length': Buffer.byteLength(text),
+    'x-github-request-id': requestId(),
+  });
+  res.end(text);
+}
+
+function mcpHandleMessage(msg) {
+  if (!msg || typeof msg !== 'object' || Array.isArray(msg)) {
+    const id = msg && typeof msg === 'object' && !Array.isArray(msg) && msg.id !== undefined ? msg.id : null;
+    return { jsonrpc: '2.0', id: id ?? null, error: { code: -32600, message: 'Invalid Request' } };
+  }
+  const method = msg.method;
+  const id = msg.id;
+  if (typeof method !== 'string') {
+    if (id === undefined) return null;
+    return { jsonrpc: '2.0', id: id ?? null, error: { code: -32600, message: 'Invalid Request' } };
+  }
+  if (id === undefined) return null;
+  const params = msg.params && typeof msg.params === 'object' && !Array.isArray(msg.params) ? msg.params : {};
+  try {
+    if (method === 'server/discover') {
+      return {
+        jsonrpc: '2.0',
+        id,
+        result: {
+          supportedVersions: [...MCP_SUPPORTED_VERSIONS],
+          capabilities: { tools: {} },
+          instructions: 'GitHub-compatible forge MCP server.',
+          serverInfo: { name: MCP_SERVER_NAME, version: MCP_SERVER_VERSION },
+        },
+      };
+    }
+    if (method === 'initialize') {
+      const pv = typeof params.protocolVersion === 'string' && params.protocolVersion !== '' ? params.protocolVersion : '2025-11-25';
+      return {
+        jsonrpc: '2.0',
+        id,
+        result: { protocolVersion: pv, capabilities: { tools: {} }, serverInfo: { name: MCP_SERVER_NAME, version: MCP_SERVER_VERSION } },
+      };
+    }
+    if (method === 'tools/list') {
+      return { jsonrpc: '2.0', id, result: { tools: MCP_TOOLS } };
+    }
+    if (method === 'tools/call') {
+      const toolName = typeof params.name === 'string' ? params.name : '';
+      const toolArgs = params.arguments && typeof params.arguments === 'object' && !Array.isArray(params.arguments) ? params.arguments : {};
+      const r = mcpCallTool(toolName, toolArgs);
+      if (r.rpcError) return { jsonrpc: '2.0', id, error: r.rpcError };
+      if (r.toolError) {
+        return { jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: String(r.toolError) }], isError: true } };
+      }
+      return { jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JSON.stringify(r.value) }], structuredContent: r.value } };
+    }
+    if (method === 'ping') return { jsonrpc: '2.0', id, result: {} };
+    return { jsonrpc: '2.0', id, error: { code: -32601, message: `Method not found: ${method}` } };
+  } catch (e) {
+    return { jsonrpc: '2.0', id, error: { code: -32602, message: e instanceof Error ? e.message : 'Internal error' } };
+  }
+}
+
+async function handleMcp(req, res) {
+  let raw;
+  try {
+    raw = await readBody(req);
+  } catch {
+    sendMcpJson(res, 400, { jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error: failed to read request body' } });
+    return;
+  }
+  const text = raw.toString('utf8');
+  let body = null;
+  let parsed = false;
+  if (text.trim() !== '') {
+    try {
+      body = JSON.parse(text);
+      parsed = true;
+    } catch {
+      parsed = false;
+    }
+  }
+  if (!parsed) {
+    sendMcpJson(res, 400, { jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error: body is not JSON' } });
+    return;
+  }
+  try {
+    if (Array.isArray(body)) {
+      const out = [];
+      for (const entry of body) {
+        const r = mcpHandleMessage(entry);
+        if (r !== null) out.push(r);
+      }
+      if (out.length === 0) {
+        res.writeHead(202, { 'x-github-request-id': requestId() });
+        res.end();
+        return;
+      }
+      sendMcpJson(res, 200, out);
+      return;
+    }
+    const single = mcpHandleMessage(body);
+    if (single === null) {
+      res.writeHead(202, { 'x-github-request-id': requestId() });
+      res.end();
+      return;
+    }
+    sendMcpJson(res, 200, single);
+  } catch (e) {
+    sendMcpJson(res, 200, { jsonrpc: '2.0', id: null, error: { code: -32602, message: e instanceof Error ? e.message : 'Internal error' } });
+  }
+}
+
+// --- Small additive REST reads the MCP setup uses (no behavior change) ---
+
+function getBranch(res, owner, name, branch) {
+  const repo = needRepo(res, owner, name);
+  if (!repo) return;
+  const tip = repo.branches.get(branch);
+  if (tip === undefined || tip === null) {
+    errMsg(res, 404, 'Not Found');
+    return;
+  }
+  sendJson(res, 200, { name: branch, commit: { sha: tip } });
+}
+
+function getGitRef(res, owner, name, branch) {
+  const repo = needRepo(res, owner, name);
+  if (!repo) return;
+  const tip = repo.branches.get(branch);
+  if (tip === undefined || tip === null) {
+    errMsg(res, 404, 'Not Found');
+    return;
+  }
+  sendJson(res, 200, { ref: `refs/heads/${branch}`, object: { sha: tip, type: 'commit' } });
+}
+
+// -----------------------------------------------------------------------------
 // Server
 // -----------------------------------------------------------------------------
 
@@ -1579,6 +2548,40 @@ function createApp() {
         await handleApi(req, res, sub.length === 0 ? '' : sub, query);
       } catch (e) {
         errMsg(res, 500, e instanceof Error ? e.message : 'Internal error');
+      }
+      return;
+    }
+
+    if (urlPath === '/api/graphql' || urlPath === '/api/graphql/') {
+      if (!authorized(req)) {
+        errMsg(res, 401, 'Requires authentication');
+        return;
+      }
+      if (method !== 'POST') {
+        errMsg(res, 404, 'Not Found');
+        return;
+      }
+      try {
+        await handleGraphQL(req, res);
+      } catch (e) {
+        errMsg(res, 500, e instanceof Error ? e.message : 'Internal error');
+      }
+      return;
+    }
+
+    if (urlPath === '/mcp' || urlPath === '/mcp/') {
+      if (!authorized(req)) {
+        errMsg(res, 401, 'Requires authentication');
+        return;
+      }
+      if (method !== 'POST') {
+        errMsg(res, 404, 'Not Found');
+        return;
+      }
+      try {
+        await handleMcp(req, res);
+      } catch (e) {
+        sendMcpJson(res, 200, { jsonrpc: '2.0', id: null, error: { code: -32602, message: e instanceof Error ? e.message : 'Internal error' } });
       }
       return;
     }
